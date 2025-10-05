@@ -1,4 +1,4 @@
-name: Stage 2 — Deploy to AKS Staging
+name: Stage 2 CI — Ephemeral Staging Deploy, Test, Teardown
 
 on:
   workflow_call:
@@ -6,31 +6,72 @@ on:
       image_tag:
         required: true
         type: string
-    secrets: inherit
 
 jobs:
-  deploy:
+  deploy_ephemeral_staging:
     runs-on: ubuntu-latest
+    env:
+      NS: stg-${{ github.run_id }}
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout repo (k8s manifests)
+        uses: actions/checkout@v4
 
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Get AKS credentials (and verify)
+        run: |
+          set -e
+          az aks get-credentials \
+            -g "${{ vars.RESOURCE_GROUP }}" \
+            -n "${{ vars.AKS_NAME }}" \
+            --overwrite-existing
+          kubectl config current-context
+          kubectl get nodes
 
-    - name: Set AKS context
-      uses: azure/aks-set-context@v3
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
-        cluster-name: aks-sit722
-        resource-group: rg-sit722
+      - name: Create ephemeral namespace
+        run: kubectl create ns "$NS"
 
-    - name: Create staging namespace
-      run: kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+      - name: Apply manifests to staging namespace
+        run: kubectl apply -n "$NS" -f k8s/
 
-    - name: Deploy manifests
-      run: |
-        sed "s|IMAGE_TAG|${{ inputs.image_tag }}|g" k8s/deployment.yaml | kubectl apply -n staging -f -
+      - name: Resolve image registry
+        id: reg
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.ACR_LOGIN_SERVER }}" ]; then
+            echo "server=${{ secrets.ACR_LOGIN_SERVER }}" >> $GITHUB_OUTPUT
+          else
+            if [ -z "${{ secrets.ACR_NAME }}" ]; then
+              echo "Either ACR_LOGIN_SERVER (e.g. sit722trilochanacr.azurecr.io) or ACR_NAME is required" 1>&2
+              exit 1
+            fi
+            SERVER=$(az acr show -n "${{ secrets.ACR_NAME }}" --query loginServer -o tsv)
+            echo "server=${SERVER}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Point deployments to freshly built images
+        run: |
+          SERVER="${{ steps.reg.outputs.server }}"
+          TAG="${{ inputs.image_tag }}"
+          kubectl set image -n "$NS" deployment/product-service product=$SERVER/product-service:$TAG
+          kubectl set image -n "$NS" deployment/order-service   order=$SERVER/order-service:$TAG
+
+      - name: Wait for rollouts
+        run: |
+          kubectl rollout status -n "$NS" deployment/product-service --timeout=180s
+          kubectl rollout status -n "$NS" deployment/order-service   --timeout=180s
+
+      - name: Smoke test /health
+        run: |
+          kubectl run curl -n "$NS" --image=curlimages/curl:8.10.1 --restart=Never --rm -i -- \
+            sh -lc 'set -e; curl -fsS http://product-service:8001/health; curl -fsS http://order-service:8000/health'
+
+      - name: Tear down staging (always)
+        if: always()
+        run: |
+          kubectl config current-context >/dev/null 2>&1 || exit 0
+          kubectl delete ns "$NS" --ignore-not-found=true --wait=true || true
