@@ -1,0 +1,36 @@
+name: Stage 2 — Deploy to AKS Staging
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        required: true
+        type: string
+    secrets: inherit
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set AKS context
+      uses: azure/aks-set-context@v3
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        cluster-name: aks-sit722
+        resource-group: rg-sit722
+
+    - name: Create staging namespace
+      run: kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy manifests
+      run: |
+        sed "s|IMAGE_TAG|${{ inputs.image_tag }}|g" k8s/deployment.yaml | kubectl apply -n staging -f -
